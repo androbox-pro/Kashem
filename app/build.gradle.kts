@@ -171,7 +171,7 @@ dependencies {
 
     // ===== পুরাতন ফাইল থেকে অতিরিক্ত ডিপেন্ডেন্সি (প্রয়োজন হলে) =====
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.11.0")
 
     val cameraxVersion = "1.5.0-alpha02"
     implementation("androidx.camera:camera-core:$cameraxVersion")
