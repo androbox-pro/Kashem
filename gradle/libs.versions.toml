@@ -2,7 +2,7 @@
 eventbus = "3.3.1"
 #jetbrains
 kotlin = "2.3.10"
-kotlin-immutable-collections = "0.4.0"
+kotlin-immutable-collections = "0.5.2"
 #KSP
 kotlinxSerializationJson = "1.10.0"
 ksp = "2.3.5"
