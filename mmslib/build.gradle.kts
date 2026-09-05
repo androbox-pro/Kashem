@@ -29,6 +29,6 @@ android {
 
 dependencies {
     implementation("com.klinkerapps:logger:1.0.3")
-    implementation("com.squareup.okhttp:okhttp:2.5.0")
-    implementation("com.squareup.okhttp:okhttp-urlconnection:2.5.0")
+    implementation("com.squareup.okhttp:okhttp:2.7.5")
+    implementation("com.squareup.okhttp:okhttp-urlconnection:2.7.5")
 }
