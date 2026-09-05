@@ -36,7 +36,7 @@ compose = "1.7.6"
 composeMaterial3 = "1.4.0"
 #Glide
 glide = "5.0.5"
-glideCompose = "1.0.0-beta08"
+glideCompose = "1.0.0-beta10"
 #Room
 room = "2.8.4"
 #ezVcard
