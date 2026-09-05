@@ -102,7 +102,7 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     api(libs.kotlin.immutable.collections)
     implementation(libs.androidx.constraintlayout)
-    implementation("androidx.viewpager:viewpager:1.0.0")
+    implementation("androidx.viewpager:viewpager:1.1.0")
     implementation(libs.androidx.documentfile)
     implementation(libs.androidx.swiperefreshlayout)
     implementation(libs.androidx.exifinterface)
