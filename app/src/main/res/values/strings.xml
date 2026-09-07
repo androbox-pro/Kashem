@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Kashem</string>
+    <string name="accessibility_desc">Auto Clicker – স্ক্রিনের নির্দিষ্ট টেক্সটে স্বয়ংক্রিয় ক্লিক করার অনুমতি দেয়</string>
+</resources>

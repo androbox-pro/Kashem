@@ -1,0 +1,1422 @@
+name: Android Build + Android 15 Full Permission & Crash Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    env:
+      JAVA_VERSION: "17"
+      ANDROID_API: "35"
+      BUILD_TOOLS_VERSION: "35.0.0"
+
+    steps:
+
+      # ============================================================
+      # CHECKOUT
+      # ============================================================
+
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+
+      # ============================================================
+      # JAVA 17
+      # ============================================================
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+
+      # ============================================================
+      # KVM
+      # ============================================================
+
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "KVM CHECK"
+          echo "============================================================"
+
+          if [ ! -e /dev/kvm ]; then
+            echo "/dev/kvm not found. Installing qemu-kvm..."
+
+            sudo apt-get update
+            sudo apt-get install -y qemu-kvm
+
+            sudo chmod 666 /dev/kvm || true
+          fi
+
+          ls -l /dev/kvm || true
+
+          if [ ! -e /dev/kvm ]; then
+            echo "❌ KVM is not available."
+            exit 1
+          fi
+
+          echo "✅ KVM is available."
+
+
+      # ============================================================
+      # ANDROID SDK
+      # ============================================================
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+
+      - name: Install Android SDK components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "ANDROID SDK SETUP"
+          echo "============================================================"
+
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API}" \
+            "build-tools;${BUILD_TOOLS_VERSION}" \
+            "emulator" \
+            "system-images;android-${ANDROID_API};google_apis;x86_64"
+
+          echo "Android SDK components installed."
+
+
+      # ============================================================
+      # GRADLE
+      # ============================================================
+
+      - name: Prepare Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          chmod +x ./gradlew
+
+          ./gradlew --version
+
+
+      # ============================================================
+      # GRADLE CACHE
+      # ============================================================
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties', '**/gradle.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+
+      # ============================================================
+      # SIGNING KEYSTORE
+      # ============================================================
+
+      - name: Decode signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/signing"
+
+          echo "$ANDROID_KEYSTORE_BASE64" \
+            | base64 --decode \
+            > "$RUNNER_TEMP/signing/release.keystore"
+
+          if [ ! -s "$RUNNER_TEMP/signing/release.keystore" ]; then
+            echo "❌ Signing keystore is empty."
+            exit 1
+          fi
+
+          echo "SIGNING_STORE_FILE=$RUNNER_TEMP/signing/release.keystore" \
+            >> "$GITHUB_ENV"
+
+          echo "✅ Signing keystore prepared."
+
+
+      # ============================================================
+      # BUILD SIGNED RELEASE
+      # ============================================================
+
+      - name: Build signed release APK
+        shell: bash
+        env:
+          SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "BUILD SIGNED RELEASE APK"
+          echo "============================================================"
+
+          ./gradlew \
+            assembleCoreRelease \
+            --stacktrace \
+            -PSIGNING_STORE_FILE="$SIGNING_STORE_FILE" \
+            -PSIGNING_STORE_PASSWORD="$SIGNING_STORE_PASSWORD" \
+            -PSIGNING_KEY_ALIAS="$SIGNING_KEY_ALIAS" \
+            -PSIGNING_KEY_PASSWORD="$SIGNING_KEY_PASSWORD"
+
+
+      # ============================================================
+      # LOCATE APK
+      # ============================================================
+
+      - name: Locate release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "LOCATE RELEASE APK"
+          echo "============================================================"
+
+          APK="$(find \
+            "$GITHUB_WORKSPACE/app/build/outputs/apk/release" \
+            -maxdepth 1 \
+            -type f \
+            -name "*.apk" \
+            | head -n 1)"
+
+          if [ -z "$APK" ]; then
+            echo "❌ Release APK not found."
+            exit 1
+          fi
+
+          APK_ABS="$(realpath "$APK")"
+
+          echo "APK_PATH=$APK_ABS" >> "$GITHUB_ENV"
+
+          echo "✅ APK:"
+          echo "$APK_ABS"
+
+
+      # ============================================================
+      # APK INSPECTION
+      # ============================================================
+
+      - name: Inspect APK and Manifest Permissions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INSPECT_DIR="$RUNNER_TEMP/apk-inspection"
+
+          mkdir -p "$INSPECT_DIR"
+
+          AAPT="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/aapt"
+          APKSIGNER="$ANDROID_HOME/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+
+          echo "============================================================"
+          echo "APK BADGING"
+          echo "============================================================"
+
+          "$AAPT" dump badging "$APK_PATH" \
+            | tee "$INSPECT_DIR/badging.txt"
+
+          APP_PACKAGE="$(
+            "$AAPT" dump badging "$APK_PATH" \
+              | sed -n "s/^package: name='\([^']*\)'.*/\1/p" \
+              | head -n 1
+          )"
+
+          if [ -z "$APP_PACKAGE" ]; then
+            echo "❌ Could not determine package name."
+            exit 1
+          fi
+
+          echo "APP_PACKAGE=$APP_PACKAGE" >> "$GITHUB_ENV"
+
+          echo "============================================================"
+          echo "PACKAGE"
+          echo "============================================================"
+
+          echo "$APP_PACKAGE" \
+            | tee "$INSPECT_DIR/package-name.txt"
+
+
+          echo "============================================================"
+          echo "RAW MANIFEST PERMISSIONS"
+          echo "============================================================"
+
+          "$AAPT" dump permissions "$APK_PATH" \
+            | tee "$INSPECT_DIR/raw-manifest-permissions.txt"
+
+
+          echo "============================================================"
+          echo "ALL DECLARED MANIFEST PERMISSIONS"
+          echo "============================================================"
+
+          "$AAPT" dump permissions "$APK_PATH" \
+            | sed -n "s/^uses-permission: name='\([^']*\)'.*/\1/p" \
+            | tr -d '\r' \
+            | sort -u \
+            > "$INSPECT_DIR/manifest-permissions-list.txt"
+
+          cat "$INSPECT_DIR/manifest-permissions-list.txt"
+
+
+          echo "============================================================"
+          echo "APK SIGNATURE"
+          echo "============================================================"
+
+          "$APKSIGNER" verify \
+            --verbose \
+            "$APK_PATH" \
+            | tee "$INSPECT_DIR/apksigner.txt"
+
+
+      # ============================================================
+      # UPLOAD APK INSPECTION
+      # ============================================================
+
+      - name: Upload APK Inspection
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: APK-Permission-Inspection
+          path: ${{ runner.temp }}/apk-inspection
+          if-no-files-found: warn
+
+
+      # ============================================================
+      # CREATE ANDROID 15 TEST SCRIPT
+      # ============================================================
+
+      - name: Create Android 15 Test Script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TEST_DIR="$RUNNER_TEMP/android15-test"
+
+          mkdir -p "$TEST_DIR"
+
+          cat > "$TEST_DIR/run-test.sh" <<'BASH_SCRIPT'
+          #!/usr/bin/env bash
+
+          set -u
+
+          echo "============================================================"
+          echo "ANDROID 15 FULL PERMISSION + CRASH TEST"
+          echo "============================================================"
+
+          TEST_DIR="${RUNNER_TEMP:-/tmp}/android15-test"
+          ARTIFACT_DIR="$TEST_DIR/results"
+
+          mkdir -p "$ARTIFACT_DIR"
+          mkdir -p "$ARTIFACT_DIR/KashemLogs"
+
+          APP_PACKAGE="${APP_PACKAGE:?APP_PACKAGE missing}"
+          APK_PATH="${APK_PATH:?APK_PATH missing}"
+
+          # ==========================================================
+          # SAFE ADB FUNCTIONS
+          # ==========================================================
+
+          adb_safe() {
+            local seconds="$1"
+            shift
+
+            timeout --foreground "${seconds}s" \
+              adb "$@"
+          }
+
+          adb_shell_safe() {
+            local seconds="$1"
+            shift
+
+            timeout --foreground "${seconds}s" \
+              adb shell "$@"
+          }
+
+
+          # ==========================================================
+          # WAIT FOR ADB
+          # ==========================================================
+
+          echo "Waiting for ADB device..."
+
+          adb wait-for-device
+
+          DEVICE_READY=0
+
+          for i in $(seq 1 60); do
+
+            STATE="$(adb get-state 2>/dev/null \
+              | tr -d '\r\n' || true)"
+
+            if [ "$STATE" = "device" ]; then
+              DEVICE_READY=1
+              break
+            fi
+
+            sleep 2
+
+          done
+
+          if [ "$DEVICE_READY" -ne 1 ]; then
+            echo "❌ Emulator is not ready."
+            exit 1
+          fi
+
+
+          # ==========================================================
+          # DEVICE INFORMATION
+          # ==========================================================
+
+          echo "============================================================"
+          echo "ANDROID DEVICE INFORMATION"
+          echo "============================================================"
+
+          adb shell getprop ro.build.version.release \
+            | tee "$ARTIFACT_DIR/android-version.txt"
+
+          adb shell getprop ro.build.version.sdk \
+            | tee "$ARTIFACT_DIR/sdk.txt"
+
+          adb shell getprop ro.build.version.security_patch \
+            | tee "$ARTIFACT_DIR/security-patch.txt"
+
+          adb shell getprop ro.product.model \
+            | tee "$ARTIFACT_DIR/device-model.txt"
+
+          adb shell getprop ro.product.manufacturer \
+            | tee "$ARTIFACT_DIR/manufacturer.txt"
+
+          adb shell getprop ro.product.cpu.abi \
+            | tee "$ARTIFACT_DIR/abi.txt"
+
+          adb shell getprop ro.product.cpu.abilist \
+            | tee "$ARTIFACT_DIR/supported-abis.txt"
+
+          adb shell getprop ro.build.fingerprint \
+            | tee "$ARTIFACT_DIR/fingerprint.txt"
+
+          adb devices -l \
+            | tee "$ARTIFACT_DIR/adb-devices.txt"
+
+          ANDROID_VERSION="$(
+            tr -d '\r' \
+              < "$ARTIFACT_DIR/android-version.txt" \
+              | head -n 1
+          )"
+
+          SDK_VERSION="$(
+            tr -d '\r' \
+              < "$ARTIFACT_DIR/sdk.txt" \
+              | head -n 1
+          )"
+
+          echo "Android version: $ANDROID_VERSION"
+          echo "SDK: $SDK_VERSION"
+
+          if [ "$ANDROID_VERSION" != "15" ] \
+             || [ "$SDK_VERSION" != "35" ]; then
+
+            echo "❌ Android 15 / SDK 35 not detected."
+            exit 1
+          fi
+
+          echo "✅ Android 15 / SDK 35 confirmed."
+
+
+          # ==========================================================
+          # INSTALL APK
+          # ==========================================================
+
+          echo "============================================================"
+          echo "INSTALL APK"
+          echo "============================================================"
+
+          adb_safe 30 uninstall "$APP_PACKAGE" \
+            >/dev/null 2>&1 || true
+
+          if ! adb_safe 90 install "$APK_PATH" \
+              > "$ARTIFACT_DIR/install-output.txt" 2>&1; then
+
+            echo "❌ APK installation failed."
+
+            cat "$ARTIFACT_DIR/install-output.txt" || true
+
+            exit 1
+          fi
+
+          echo "✅ APK installation successful."
+
+
+          # ==========================================================
+          # PACKAGE INFO
+          # ==========================================================
+
+          adb_shell_safe 30 dumpsys package "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/raw-package-info.txt" 2>&1 || true
+
+          adb_shell_safe 30 pm path "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/installed-package-path.txt" 2>&1 || true
+
+
+          # ==========================================================
+          # MANIFEST PERMISSIONS
+          # ==========================================================
+
+          MANIFEST_PERMISSION_FILE="$RUNNER_TEMP/apk-inspection/manifest-permissions-list.txt"
+
+          if [ ! -s "$MANIFEST_PERMISSION_FILE" ]; then
+            echo "❌ Manifest permission list is empty."
+            exit 1
+          fi
+
+          cp "$MANIFEST_PERMISSION_FILE" \
+            "$ARTIFACT_DIR/manifest-permissions-list.txt"
+
+          TOTAL_DECLARED="$(
+            grep -c . \
+              "$MANIFEST_PERMISSION_FILE" \
+              2>/dev/null || echo 0
+          )"
+
+          echo "============================================================"
+          echo "ALL MANIFEST PERMISSIONS"
+          echo "============================================================"
+
+          cat "$MANIFEST_PERMISSION_FILE"
+
+          echo
+          echo "Total declared: $TOTAL_DECLARED"
+
+
+          # ==========================================================
+          # DANGEROUS PERMISSIONS
+          # ==========================================================
+
+          echo "============================================================"
+          echo "ANDROID 15 DANGEROUS PERMISSION DATABASE"
+          echo "============================================================"
+
+          DANGEROUS_RAW="$ARTIFACT_DIR/raw-dangerous-permissions.txt"
+
+          adb_shell_safe 30 pm list permissions -d \
+            > "$DANGEROUS_RAW" 2>&1 || true
+
+          DANGEROUS_FILE="$ARTIFACT_DIR/dangerous-permissions-list.txt"
+
+          : > "$DANGEROUS_FILE"
+
+          # Format:
+          # permission:android.permission.CAMERA
+          grep -Eo \
+            'permission:android\.permission\.[A-Z0-9_\.]+' \
+            "$DANGEROUS_RAW" \
+            | sed 's/^permission://' \
+            | sort -u \
+            >> "$DANGEROUS_FILE" \
+            || true
+
+          # Alternate format:
+          # Permission: android.permission.CAMERA
+          grep -E \
+            '^[[:space:]]*[Pp]ermission:' \
+            "$DANGEROUS_RAW" \
+            | sed -E \
+              's/^[[:space:]]*[Pp]ermission:[[:space:]]*//' \
+            | grep '^android\.permission\.' \
+            | sort -u \
+            >> "$DANGEROUS_FILE" \
+            || true
+
+          sort -u "$DANGEROUS_FILE" \
+            -o "$DANGEROUS_FILE"
+
+          echo "Detected dangerous permissions:"
+
+          if [ -s "$DANGEROUS_FILE" ]; then
+            cat "$DANGEROUS_FILE"
+          else
+            echo "⚠️ No dangerous permissions parsed."
+            echo
+            echo "RAW DATABASE:"
+            cat "$DANGEROUS_RAW" || true
+          fi
+
+
+          # ==========================================================
+          # PERMISSION REPORT
+          # ==========================================================
+
+          REPORT="$ARTIFACT_DIR/manifest-permissions.txt"
+
+          echo "Permission | Declared | Type | GrantAttempt | State | Notes" \
+            > "$REPORT"
+
+          echo \
+            "--------------------------------------------------------------------------------" \
+            >> "$REPORT"
+
+
+          # ==========================================================
+          # IS DANGEROUS?
+          # ==========================================================
+
+          is_dangerous() {
+
+            local permission="$1"
+
+            grep -Fxq \
+              "$permission" \
+              "$DANGEROUS_FILE" \
+              2>/dev/null
+
+          }
+
+
+          # ==========================================================
+          # CHECK PERMISSION
+          # ==========================================================
+
+          check_permission() {
+
+            local permission="$1"
+
+            local result=""
+
+            result="$(
+              adb_shell_safe 15 \
+                pm check-permission \
+                "$APP_PACKAGE" \
+                "$permission" \
+                2>/dev/null \
+                | tr -d '\r' \
+                | tail -n 1 \
+                || true
+            )"
+
+            if echo "$result" | grep -qi "granted"; then
+              echo "GRANTED"
+              return 0
+            fi
+
+            if echo "$result" | grep -qi "denied"; then
+              echo "NOT_GRANTED"
+              return 0
+            fi
+
+            # Fallback to dumpsys.
+            if adb_shell_safe 15 \
+                dumpsys package "$APP_PACKAGE" \
+                2>/dev/null \
+                | grep -Fq \
+                "$permission: granted=true"; then
+
+              echo "GRANTED"
+              return 0
+            fi
+
+            echo "NOT_GRANTED"
+
+          }
+
+
+          # ==========================================================
+          # GRANT ALL DANGEROUS PERMISSIONS
+          # ==========================================================
+
+          echo "============================================================"
+          echo "GRANTING ALL DECLARED DANGEROUS PERMISSIONS"
+          echo "============================================================"
+
+          GRANT_ATTEMPTS=0
+          GRANT_SUCCESS=0
+          GRANT_FAILURES=0
+
+          while IFS= read -r permission; do
+
+            [ -z "$permission" ] && continue
+
+            echo
+            echo "Checking:"
+            echo "$permission"
+
+            if is_dangerous "$permission"; then
+
+              echo "  Type: DANGEROUS / RUNTIME"
+              echo "  Grant: attempting"
+
+              GRANT_ATTEMPTS=$((GRANT_ATTEMPTS + 1))
+
+              SAFE_NAME="$(echo "$permission" \
+                | tr '/:' '__')"
+
+              GRANT_OUTPUT="$ARTIFACT_DIR/grant-${SAFE_NAME}.txt"
+
+              if timeout --foreground 15s \
+                  adb shell pm grant \
+                  "$APP_PACKAGE" \
+                  "$permission" \
+                  > "$GRANT_OUTPUT" 2>&1; then
+
+                echo "  Grant command: SUCCESS"
+
+                GRANT_SUCCESS=$((GRANT_SUCCESS + 1))
+
+              else
+
+                echo "  Grant command: FAILED / RESTRICTED"
+
+                GRANT_FAILURES=$((GRANT_FAILURES + 1))
+
+              fi
+
+              STATE="$(check_permission "$permission")"
+
+            else
+
+              echo "  Type: NON-DANGEROUS / SPECIAL"
+              echo "  Grant: not attempted"
+
+              STATE="$(check_permission "$permission")"
+
+            fi
+
+            NOTE=""
+
+            case "$permission" in
+
+              android.permission.RECORD_AUDIO)
+                NOTE="CRITICAL: microphone foreground-service test."
+                ;;
+
+              android.permission.POST_NOTIFICATIONS)
+                NOTE="Runtime notification permission."
+                ;;
+
+              android.permission.CAMERA)
+                NOTE="Runtime camera permission."
+                ;;
+
+              android.permission.ACCESS_FINE_LOCATION)
+                NOTE="Runtime location permission."
+                ;;
+
+              android.permission.ACCESS_COARSE_LOCATION)
+                NOTE="Runtime location permission."
+                ;;
+
+              android.permission.ACCESS_BACKGROUND_LOCATION)
+                NOTE="Special/restricted background location."
+                ;;
+
+              android.permission.BIND_NOTIFICATION_LISTENER_SERVICE)
+                NOTE="Special notification-listener access; not pm grant."
+                ;;
+
+              android.permission.FOREGROUND_SERVICE_MICROPHONE)
+                NOTE="FGS microphone declaration permission."
+                ;;
+
+              android.permission.FOREGROUND_SERVICE_CAMERA)
+                NOTE="FGS camera declaration permission."
+                ;;
+
+              android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION)
+                NOTE="Media projection FGS declaration permission."
+                ;;
+
+            esac
+
+            if is_dangerous "$permission"; then
+              TYPE="DANGEROUS"
+              ATTEMPT="YES"
+            else
+              TYPE="NON_DANGEROUS_OR_SPECIAL"
+              ATTEMPT="NO"
+            fi
+
+            printf \
+              '%s | YES | %s | %s | %s | %s\n' \
+              "$permission" \
+              "$TYPE" \
+              "$ATTEMPT" \
+              "$STATE" \
+              "$NOTE" \
+              >> "$REPORT"
+
+          done < "$MANIFEST_PERMISSION_FILE"
+
+
+          # ==========================================================
+          # PERMISSION SUMMARY
+          # ==========================================================
+
+          GRANTED_COUNT=0
+          NOT_GRANTED_COUNT=0
+          UNKNOWN_COUNT=0
+
+          echo "============================================================"
+          echo "VERIFY EVERY MANIFEST PERMISSION"
+          echo "============================================================"
+
+          while IFS='|' read -r \
+              permission declared type attempt state notes; do
+
+            [ "$permission" = "Permission " ] && continue
+            [ -z "$permission" ] && continue
+
+            permission="$(
+              echo "$permission" \
+                | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            )"
+
+            state="$(
+              echo "$state" \
+                | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+            )"
+
+            printf \
+              "%-12s | %s\n" \
+              "$state" \
+              "$permission"
+
+            case "$state" in
+
+              GRANTED)
+                GRANTED_COUNT=$((GRANTED_COUNT + 1))
+                ;;
+
+              NOT_GRANTED)
+                NOT_GRANTED_COUNT=$((NOT_GRANTED_COUNT + 1))
+                ;;
+
+              *)
+                UNKNOWN_COUNT=$((UNKNOWN_COUNT + 1))
+                ;;
+
+            esac
+
+          done < "$REPORT"
+
+
+          cat > "$ARTIFACT_DIR/permission-summary.txt" <<EOF
+          Total declared: $TOTAL_DECLARED
+          Granted:        $GRANTED_COUNT
+          Not granted:    $NOT_GRANTED_COUNT
+          Unknown:        $UNKNOWN_COUNT
+
+          Dangerous grant attempts:       $GRANT_ATTEMPTS
+          Successful grant commands:      $GRANT_SUCCESS
+          Failed/restricted grant commands: $GRANT_FAILURES
+          EOF
+
+
+          echo "============================================================"
+          echo "PERMISSION SUMMARY"
+          echo "============================================================"
+
+          cat "$ARTIFACT_DIR/permission-summary.txt"
+
+
+          # ==========================================================
+          # CRITICAL PERMISSION CHECK
+          # ==========================================================
+
+          echo "============================================================"
+          echo "CRITICAL PERMISSION CHECK"
+          echo "============================================================"
+
+          RECORD_AUDIO_STATE="$(
+            check_permission \
+              "android.permission.RECORD_AUDIO"
+          )"
+
+          POST_NOTIFICATION_STATE="$(
+            check_permission \
+              "android.permission.POST_NOTIFICATIONS"
+          )"
+
+          echo \
+            "android.permission.RECORD_AUDIO = $RECORD_AUDIO_STATE"
+
+          echo \
+            "android.permission.POST_NOTIFICATIONS = $POST_NOTIFICATION_STATE"
+
+          {
+            echo "RECORD_AUDIO=$RECORD_AUDIO_STATE"
+            echo "POST_NOTIFICATIONS=$POST_NOTIFICATION_STATE"
+          } > "$ARTIFACT_DIR/critical-permissions.txt"
+
+          CRITICAL_PERMISSION_FAILURE=0
+
+          if [ "$RECORD_AUDIO_STATE" = "GRANTED" ]; then
+            echo "✅ RECORD_AUDIO is GRANTED."
+          else
+            echo "❌ RECORD_AUDIO is NOT GRANTED."
+            CRITICAL_PERMISSION_FAILURE=1
+          fi
+
+          if [ "$POST_NOTIFICATION_STATE" = "GRANTED" ]; then
+            echo "✅ POST_NOTIFICATIONS is GRANTED."
+          else
+            echo "⚠️ POST_NOTIFICATIONS is NOT GRANTED."
+          fi
+
+
+          # ==========================================================
+          # APPOPS
+          # ==========================================================
+
+          echo "============================================================"
+          echo "APPOPS"
+          echo "============================================================"
+
+          adb_shell_safe 30 \
+            cmd appops get "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/appops-before-launch.txt" \
+            2>&1 || true
+
+          cat "$ARTIFACT_DIR/appops-before-launch.txt"
+
+
+          # ==========================================================
+          # PACKAGE STATE BEFORE LAUNCH
+          # ==========================================================
+
+          adb_shell_safe 30 \
+            dumpsys package "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/package-state-before-launch.txt" \
+            2>&1 || true
+
+
+          # ==========================================================
+          # CLEAR OLD LOGCAT
+          # ==========================================================
+
+          echo "Clearing logcat..."
+
+          timeout --foreground 20s \
+            adb logcat -c \
+            || true
+
+
+          # ==========================================================
+          # LAUNCH APP
+          # ==========================================================
+
+          echo "============================================================"
+          echo "LAUNCH APPLICATION"
+          echo "============================================================"
+
+          if ! timeout --foreground 30s \
+              adb shell monkey \
+              -p "$APP_PACKAGE" \
+              -c android.intent.category.LAUNCHER \
+              1 \
+              > "$ARTIFACT_DIR/launch-output.txt" 2>&1; then
+
+            echo "⚠️ Launch command returned non-zero."
+
+            cat "$ARTIFACT_DIR/launch-output.txt" || true
+
+          else
+
+            echo "✅ Launch command completed."
+
+          fi
+
+          echo "Waiting 30 seconds..."
+
+          sleep 30
+
+
+          # ==========================================================
+          # PROCESS CHECK
+          # ==========================================================
+
+          PID="$(
+            adb_shell_safe 15 \
+              pidof "$APP_PACKAGE" \
+              | tr -d '\r' \
+              | awk '{print $1}' \
+              || true
+          )"
+
+          echo "$PID" \
+            > "$ARTIFACT_DIR/app-pid.txt"
+
+          if [ -n "$PID" ]; then
+            echo "PID: $PID"
+            echo "✅ Application process is alive."
+          else
+            echo "❌ Application process is NOT alive."
+          fi
+
+
+          # ==========================================================
+          # ACTIVITY STATE
+          # ==========================================================
+
+          timeout --foreground 30s \
+            adb shell dumpsys activity activities \
+            > "$ARTIFACT_DIR/activity-state.txt" \
+            2>&1 || true
+
+
+          # ==========================================================
+          # SERVICE STATE
+          # ==========================================================
+
+          echo "============================================================"
+          echo "FOREGROUND SERVICE STATE"
+          echo "============================================================"
+
+          timeout --foreground 30s \
+            adb shell dumpsys activity services "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/service-state.txt" \
+            2>&1 || true
+
+          grep -E \
+            "ServiceRecord|NotificationCaptureService|startForeground|foreground|mic|microphone" \
+            "$ARTIFACT_DIR/service-state.txt" \
+            || true
+
+
+          # Global service dump.
+          timeout --foreground 30s \
+            adb shell dumpsys activity services \
+            > "$ARTIFACT_DIR/foreground-service-state.txt" \
+            2>&1 || true
+
+
+          # ==========================================================
+          # COLLECT APP LOG
+          # ==========================================================
+
+          echo "============================================================"
+          echo "COLLECT KASHEM APP LOG"
+          echo "============================================================"
+
+          timeout --foreground 20s \
+            adb pull \
+            "/sdcard/Download/KashemLogs/app_logs.txt" \
+            "$ARTIFACT_DIR/KashemLogs/app_logs.txt" \
+            > "$ARTIFACT_DIR/KashemLogs/pull-output.txt" \
+            2>&1 \
+            || true
+
+          if [ -s "$ARTIFACT_DIR/KashemLogs/app_logs.txt" ]; then
+            echo "✅ app_logs.txt FOUND."
+          else
+            echo "⚠️ app_logs.txt not found."
+
+            cat "$ARTIFACT_DIR/KashemLogs/pull-output.txt" \
+              || true
+          fi
+
+
+          # ==========================================================
+          # FULL LOGCAT
+          # ==========================================================
+
+          echo "============================================================"
+          echo "FULL LOGCAT"
+          echo "============================================================"
+
+          timeout --foreground 30s \
+            adb logcat -d -v threadtime \
+            > "$ARTIFACT_DIR/logcat.txt" \
+            2>&1 \
+            || true
+
+
+          # ==========================================================
+          # APP-SPECIFIC LOGCAT
+          # ==========================================================
+
+          if [ -n "$PID" ]; then
+
+            grep -F "$PID" \
+              "$ARTIFACT_DIR/logcat.txt" \
+              > "$ARTIFACT_DIR/app-logcat-by-pid.txt" \
+              || true
+
+          else
+
+            : > "$ARTIFACT_DIR/app-logcat-by-pid.txt"
+
+          fi
+
+          grep -iF "$APP_PACKAGE" \
+            "$ARTIFACT_DIR/logcat.txt" \
+            > "$ARTIFACT_DIR/app-logcat-by-package.txt" \
+            || true
+
+
+          # ==========================================================
+          # CRASH BUFFER
+          # ==========================================================
+
+          timeout --foreground 30s \
+            adb logcat -b crash -d -v threadtime \
+            > "$ARTIFACT_DIR/crash-buffer.txt" \
+            2>&1 \
+            || true
+
+
+          # ==========================================================
+          # EVENTS
+          # ==========================================================
+
+          timeout --foreground 30s \
+            adb logcat -b events -d -v threadtime \
+            > "$ARTIFACT_DIR/events-log.txt" \
+            2>&1 \
+            || true
+
+          grep -iE \
+            "am_crash|am_anr|$APP_PACKAGE" \
+            "$ARTIFACT_DIR/events-log.txt" \
+            > "$ARTIFACT_DIR/app-events.txt" \
+            || true
+
+
+          # ==========================================================
+          # CRASH FILTER
+          # ==========================================================
+
+          {
+            echo "================ APP PACKAGE LOGCAT ================"
+
+            grep -iF "$APP_PACKAGE" \
+              "$ARTIFACT_DIR/logcat.txt" \
+              || true
+
+            echo
+            echo "================ CRASH BUFFER ================"
+
+            cat "$ARTIFACT_DIR/crash-buffer.txt" \
+              || true
+
+            echo
+            echo "================ APP EVENTS ================"
+
+            cat "$ARTIFACT_DIR/app-events.txt" \
+              || true
+
+          } > "$ARTIFACT_DIR/crash-filtered.txt"
+
+
+          # ==========================================================
+          # ANDROID 15 MICROPHONE FGS SECURITY CHECK
+          # ==========================================================
+
+          echo "============================================================"
+          echo "FOREGROUND SERVICE SECURITY CHECK"
+          echo "============================================================"
+
+          FGS_MATCHES="$ARTIFACT_DIR/fgs-security-matches.txt"
+
+          : > "$FGS_MATCHES"
+
+          grep -iE \
+            "Starting FGS with type microphone|\
+             FOREGROUND_SERVICE_MICROPHONE|\
+             RECORD_AUDIO|\
+             eligible state|\
+             foreground service.*SecurityException|\
+             Failed to start foreground service" \
+            "$ARTIFACT_DIR/logcat.txt" \
+            >> "$FGS_MATCHES" \
+            || true
+
+          if [ -s "$ARTIFACT_DIR/KashemLogs/app_logs.txt" ]; then
+
+            grep -iE \
+              "Starting FGS with type microphone|\
+               FOREGROUND_SERVICE_MICROPHONE|\
+               RECORD_AUDIO|\
+               eligible state|\
+               SecurityException|\
+               Failed to start foreground service" \
+              "$ARTIFACT_DIR/KashemLogs/app_logs.txt" \
+              >> "$FGS_MATCHES" \
+              || true
+
+          fi
+
+
+          # ----------------------------------------------------------
+          # Ignore harmless mentions of RECORD_AUDIO.
+          #
+          # We only fail on actual security/FGS failure patterns.
+          # ----------------------------------------------------------
+
+          FGS_FAILURE=0
+
+          if grep -iE \
+              "Starting FGS with type microphone.*SecurityException|\
+               SecurityException.*Starting FGS|\
+               foreground service.*SecurityException|\
+               Failed to start foreground service|\
+               requires permissions:.*FOREGROUND_SERVICE_MICROPHONE|\
+               requires permissions:.*RECORD_AUDIO|\
+               eligible state/exemptions" \
+              "$FGS_MATCHES" \
+              >/dev/null 2>&1; then
+
+            echo "❌ Microphone FGS security/eligibility failure detected."
+
+            FGS_FAILURE=1
+
+          else
+
+            echo "✅ No microphone FGS SecurityException detected."
+
+          fi
+
+
+          # ==========================================================
+          # APPLICATION CRASH CHECK
+          # ==========================================================
+
+          echo "============================================================"
+          echo "APPLICATION CRASH CHECK"
+          echo "============================================================"
+
+          CRASH_FAILURE=0
+
+
+          # FATAL EXCEPTION.
+          if grep -iF "$APP_PACKAGE" \
+              "$ARTIFACT_DIR/logcat.txt" \
+              | grep -iE \
+                "FATAL EXCEPTION|AndroidRuntime.*FATAL|Process: $APP_PACKAGE" \
+              > "$ARTIFACT_DIR/fatal-exception.txt"; then
+
+            echo "❌ Fatal application exception detected."
+
+            CRASH_FAILURE=1
+
+          else
+
+            : > "$ARTIFACT_DIR/fatal-exception.txt"
+
+          fi
+
+
+          # am_crash / am_anr.
+          if grep -iE \
+              "am_crash|am_anr" \
+              "$ARTIFACT_DIR/app-events.txt" \
+              > "$ARTIFACT_DIR/am-crash-anr.txt"; then
+
+            echo "❌ am_crash/am_anr detected."
+
+            CRASH_FAILURE=1
+
+          else
+
+            : > "$ARTIFACT_DIR/am-crash-anr.txt"
+
+          fi
+
+
+          # Application-specific exceptions.
+          if grep -iF "$APP_PACKAGE" \
+              "$ARTIFACT_DIR/logcat.txt" \
+              | grep -iE \
+                "RuntimeException|SecurityException|IllegalStateException" \
+              > "$ARTIFACT_DIR/app-exceptions.txt"; then
+
+            echo "❌ Application-specific exception detected."
+
+            CRASH_FAILURE=1
+
+          else
+
+            : > "$ARTIFACT_DIR/app-exceptions.txt"
+
+          fi
+
+
+          # Process must remain alive.
+          if [ -z "$PID" ]; then
+
+            echo "❌ Application process is not alive."
+
+            CRASH_FAILURE=1
+
+          fi
+
+
+          # ==========================================================
+          # FINAL DIAGNOSTICS
+          # ==========================================================
+
+          adb_shell_safe 30 \
+            dumpsys meminfo "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/meminfo.txt" \
+            2>&1 || true
+
+          adb_shell_safe 30 \
+            dumpsys package "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/package-info-final.txt" \
+            2>&1 || true
+
+          adb_shell_safe 30 \
+            cmd appops get "$APP_PACKAGE" \
+            > "$ARTIFACT_DIR/appops-final.txt" \
+            2>&1 || true
+
+          date -u +%Y-%m-%dT%H:%M:%SZ \
+            > "$ARTIFACT_DIR/test-end-time.txt"
+
+
+          # ==========================================================
+          # FINAL RESULT
+          # ==========================================================
+
+          FINAL_FAILURE=0
+
+          if [ "$RECORD_AUDIO_STATE" != "GRANTED" ]; then
+            echo "❌ FINAL FAILURE: RECORD_AUDIO not granted."
+            FINAL_FAILURE=1
+          fi
+
+          if [ "$FGS_FAILURE" -ne 0 ]; then
+            echo "❌ FINAL FAILURE: Microphone FGS security problem."
+            FINAL_FAILURE=1
+          fi
+
+          if [ "$CRASH_FAILURE" -ne 0 ]; then
+            echo "❌ FINAL FAILURE: Application crash/process failure."
+            FINAL_FAILURE=1
+          fi
+
+
+          {
+            echo "ANDROID_VERSION=$ANDROID_VERSION"
+            echo "SDK_VERSION=$SDK_VERSION"
+            echo "APP_PACKAGE=$APP_PACKAGE"
+            echo "PID=${PID:-NONE}"
+            echo "TOTAL_DECLARED=$TOTAL_DECLARED"
+            echo "GRANTED_COUNT=$GRANTED_COUNT"
+            echo "NOT_GRANTED_COUNT=$NOT_GRANTED_COUNT"
+            echo "UNKNOWN_COUNT=$UNKNOWN_COUNT"
+            echo "RECORD_AUDIO=$RECORD_AUDIO_STATE"
+            echo "POST_NOTIFICATIONS=$POST_NOTIFICATION_STATE"
+            echo "FGS_FAILURE=$FGS_FAILURE"
+            echo "CRASH_FAILURE=$CRASH_FAILURE"
+            echo "FINAL_FAILURE=$FINAL_FAILURE"
+          } > "$ARTIFACT_DIR/final-result.txt"
+
+
+          echo
+          echo "============================================================"
+          echo "FINAL TEST RESULT"
+          echo "============================================================"
+
+          cat "$ARTIFACT_DIR/final-result.txt"
+
+          echo
+          echo "============================================================"
+          echo "TEST FINISHED"
+          echo "============================================================"
+
+          exit "$FINAL_FAILURE"
+
+          BASH_SCRIPT
+
+          chmod +x "$TEST_DIR/run-test.sh"
+
+          echo "✅ Android 15 test script created."
+
+
+      # ============================================================
+      # ANDROID 15 EMULATOR TEST
+      # ============================================================
+
+      - name: Android 15 Full Permission + Crash Test
+        uses: reactivecircus/android-emulator-runner@v2
+        env:
+          APP_PACKAGE: ${{ env.APP_PACKAGE }}
+          APK_PATH: ${{ env.APK_PATH }}
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+
+          cores: 2
+          ram-size: 2048
+          heap-size: 512
+          disk-size: 4096
+
+          force-avd-creation: true
+
+          emulator-boot-timeout: 300
+
+          emulator-options: >-
+            -no-window
+            -no-audio
+            -no-boot-anim
+            -gpu swiftshader_indirect
+            -no-snapshot-save
+
+          disable-animations: true
+
+          script: |
+            bash "$RUNNER_TEMP/android15-test/run-test.sh"
+
+
+      # ============================================================
+      # UPLOAD ANDROID 15 RESULTS
+      # ============================================================
+
+      - name: Upload Android 15 Full Test Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Android-15-Full-Permission-Test
+          path: ${{ runner.temp }}/android15-test/results
+          if-no-files-found: warn
+
+
+      # ============================================================
+      # CLEAN SIGNING KEYSTORE
+      # ============================================================
+
+      - name: Cleanup signing keystore
+        if: always()
+        shell: bash
+        run: |
+          set +e
+
+          if [ -n "${SIGNING_STORE_FILE:-}" ]; then
+            rm -f "$SIGNING_STORE_FILE"
+          fi
+
+          echo "Temporary signing keystore removed."
