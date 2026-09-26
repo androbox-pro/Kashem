@@ -1,0 +1,147 @@
+name: Auto Process Video on Push
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# ═══════════════════════════════════════════════════════════
+# 🎯 শুধু এখানে মান পরিবর্তন করুন — বাকি সব অটো adjust হবে
+# ═══════════════════════════════════════════════════════════
+env:
+  TRIM_SECONDS: 9
+  INPUT_FILE: video/video.mp4
+  OVERLAY_FILE: overly/photo.png
+  OUTPUT_FILE: final_video.mp4
+  OVERLAY_MODE: cover      # cover | contain | stretch
+# ═══════════════════════════════════════════════════════════
+
+jobs:
+  process-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ১. ডিস্ক স্পেস খালি করা
+      - name: Maximize Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /var/lib/docker
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+          df -h
+
+      # ২. FFmpeg ইনস্টল
+      - name: Install FFmpeg & Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+
+      # ৩. ভিডিওর resolution বের করা
+      - name: Detect Video Resolution
+        id: video_info
+        run: |
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "❌ Error: $INPUT_FILE পাওয়া যায়নি!"
+            exit 1
+          fi
+
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width \
+                  -of csv=s=x:p=0 "$INPUT_FILE" | cut -d'x' -f1)
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height \
+                  -of csv=s=x:p=0 "$INPUT_FILE" | cut -d'x' -f2)
+
+          echo "📐 ভিডিও Resolution: ${WIDTH}x${HEIGHT}"
+          echo "WIDTH=$WIDTH" >> $GITHUB_OUTPUT
+          echo "HEIGHT=$HEIGHT" >> $GITHUB_OUTPUT
+
+      # ৪. ট্রিম + Full-Screen Overlay + সর্বোচ্চ কোয়ালিটি এনকোড
+      - name: Process Video (${TRIM_SECONDS}s, Full-Screen Overlay)
+        run: |
+          WIDTH=${{ steps.video_info.outputs.WIDTH }}
+          HEIGHT=${{ steps.video_info.outputs.HEIGHT }}
+
+          echo "🎬 ট্রিম সময়: ${TRIM_SECONDS} সেকেন্ড"
+          echo "📐 Overlay resolution: ${WIDTH}x${HEIGHT}"
+          echo "🎨 Overlay mode: ${OVERLAY_MODE}"
+
+          # Overlay scaling filter তৈরি (mode অনুযায়ী)
+          case "$OVERLAY_MODE" in
+            stretch)
+              # পুরো স্ক্রিন জুড়ে ছড়িয়ে দেবে (aspect ratio ভাঙবে)
+              SCALE_FILTER="scale=${WIDTH}:${HEIGHT}"
+              ;;
+            contain)
+              # পূর্ণ overlay দেখাবে, খালি জায়গা স্বচ্ছ থাকবে
+              SCALE_FILTER="scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black@0"
+              ;;
+            cover|*)
+              # ⭐ পুরো স্ক্রিন ঢাকবে (ডিফল্ট) — Full Screen Cover
+              SCALE_FILTER="scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT}"
+              ;;
+          esac
+
+          if [ -f "$OVERLAY_FILE" ]; then
+              echo "✅ Full-Screen Overlay সহ ভিডিও তৈরি হচ্ছে..."
+              ffmpeg -thread_queue_size 1024 -t "$TRIM_SECONDS" -i "$INPUT_FILE" \
+                     -thread_queue_size 1024 -loop 1 -t "$TRIM_SECONDS" -i "$OVERLAY_FILE" \
+                     -filter_complex \
+                     "[1:v]format=rgba,${SCALE_FILTER},setsar=1[ovr];[0:v][ovr]overlay=0:0:format=auto,format=yuv420p[outv]" \
+                     -map "[outv]" -map 0:a? \
+                     -t "$TRIM_SECONDS" \
+                     -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p \
+                     -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+                     -movflags +faststart \
+                     -c:a aac -b:a 192k \
+                     "$OUTPUT_FILE" -y
+          else
+              echo "ℹ️ Overlay পাওয়া যায়নি, শুধু ট্রিম হচ্ছে..."
+              ffmpeg -thread_queue_size 1024 -t "$TRIM_SECONDS" -i "$INPUT_FILE" \
+                     -t "$TRIM_SECONDS" \
+                     -c:v libx264 -crf 10 -preset slow -pix_fmt yuv420p \
+                     -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+                     -movflags +faststart \
+                     -c:a aac -b:a 192k \
+                     "$OUTPUT_FILE" -y
+          fi
+
+          echo "📊 আউটপুট ভিডিও তথ্য:"
+          ffprobe -v error -show_entries format=duration,size \
+                  -show_entries stream=width,height -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+
+      # ৫. প্রতি সেকেন্ডে I-frame PNG extract (dynamic)
+      - name: Extract I-Frame PNG (${TRIM_SECONDS} seconds)
+        run: |
+          mkdir -p extracted_frames
+
+          for ((t=0; t<TRIM_SECONDS; t++)); do
+            ffmpeg -ss "$t" -i "$OUTPUT_FILE" -frames:v 1 -q:v 1 \
+                   "extracted_frames/iframe_${t}s.png" -y
+            echo "✅ Extract হয়েছে: iframe_${t}s.png"
+          done
+
+          echo "📁 মোট ${TRIM_SECONDS}টি PNG তৈরি হয়েছে:"
+          ls -la extracted_frames/
+
+      # ৬. ফাইনাল ভিডিও Artifact আপলোড
+      - name: Upload Processed Video
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-processed-video
+          path: ${{ env.OUTPUT_FILE }}
+          retention-days: 7
+
+      # ৭. PNG Frames Artifact আপলোড
+      - name: Upload Extracted PNG Frames
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-png-frames
+          path: extracted_frames/
+          retention-days: 7
