@@ -1,0 +1,244 @@
+name: Auto Process Video on Push
+
+# ═══════════════════════════════════════════════════════════
+# 🚀 Push করলেই অটো চালু হবে — কোনো manual run লাগবে না
+# ═══════════════════════════════════════════════════════════
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'video/**'
+      - 'overly/**'
+      - '.github/workflows/main.yml'
+  workflow_dispatch:   # চাইলে ম্যানুয়ালিও চালানো যাবে (optional)
+# ═══════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════
+# 🎯 শুধু এখানে মান পরিবর্তন করুন — বাকি সব অটো adjust হবে
+# ═══════════════════════════════════════════════════════════
+env:
+  TRIM_SECONDS: 14
+  INPUT_FILE: video/video.mp4
+  OVERLAY_FILE: overly/photo.png
+  OUTPUT_FILE: final_video.mp4
+  AUDIO_FILE: extracted_audio.m4a
+  OVERLAY_MODE: cover      # cover | contain | stretch
+  CRF: 12                  # কম = ভালো কোয়ালিটি (0-51), 12 ≈ visually lossless
+  PRESET: veryslow         # ultrafast → veryslow (ধীর = ছোট+ভালো)
+# ═══════════════════════════════════════════════════════════
+
+jobs:
+  process-and-upload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      # ১. ডিস্ক স্পেস খালি করা
+      - name: Maximize Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/local/lib/node_modules
+          sudo rm -rf /var/lib/docker || true
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY" || true
+          df -h
+
+      # ২. FFmpeg ইনস্টল
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
+      # ৩. Input validation
+      - name: Validate Inputs
+        run: |
+          if [ ! -f "$INPUT_FILE" ]; then
+            echo "❌ Error: $INPUT_FILE পাওয়া যায়নি!"
+            exit 1
+          fi
+          echo "✅ Input পাওয়া গেছে: $INPUT_FILE"
+          ls -lh "$INPUT_FILE"
+
+          if [ -f "$OVERLAY_FILE" ]; then
+            echo "✅ Overlay পাওয়া গেছে: $OVERLAY_FILE"
+            ls -lh "$OVERLAY_FILE"
+          else
+            echo "ℹ️ Overlay পাওয়া যায়নি — শুধু ট্রিম হবে।"
+          fi
+
+      # ৪. ভিডিওর resolution বের করা
+      - name: Detect Video Resolution
+        id: video_info
+        run: |
+          WIDTH=$(ffprobe -v error -select_streams v:0 -show_entries stream=width \
+                  -of csv=p=0 "$INPUT_FILE" | head -n1 | tr -d '\r ')
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height \
+                  -of csv=p=0 "$INPUT_FILE" | head -n1 | tr -d '\r ')
+
+          if [ -z "$WIDTH" ] || [ -z "$HEIGHT" ]; then
+            echo "❌ Resolution detect করা যায়নি!"
+            exit 1
+          fi
+
+          echo "📐 ভিডিও Resolution: ${WIDTH}x${HEIGHT}"
+          echo "WIDTH=$WIDTH" >> "$GITHUB_OUTPUT"
+          echo "HEIGHT=$HEIGHT" >> "$GITHUB_OUTPUT"
+
+      # ৫. Audio আছে কি না চেক
+      - name: Check for Audio Stream
+        id: audio_check
+        run: |
+          HAS_AUDIO=$(ffprobe -v error -select_streams a -show_entries stream=index \
+                      -of csv=p=0 "$INPUT_FILE" | head -n1)
+          if [ -n "$HAS_AUDIO" ]; then
+            echo "✅ ভিডিওতে audio track আছে।"
+            echo "HAS_AUDIO=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ℹ️ ভিডিওতে কোনো audio track নেই।"
+            echo "HAS_AUDIO=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ৬. 🎵 Audio Extract (প্রথম ১০ সেকেন্ড)
+      - name: Extract Audio (First 10s)
+        if: steps.audio_check.outputs.HAS_AUDIO == 'true'
+        run: |
+          echo "🎵 Audio extract হচ্ছে: $AUDIO_FILE"
+          ffmpeg -hide_banner -y \
+            -thread_queue_size 1024 -t "$TRIM_SECONDS" -i "$INPUT_FILE" \
+            -vn \
+            -c:a aac -b:a 320k -ar 48000 -ac 2 \
+            "$AUDIO_FILE"
+
+          echo "📊 Audio তথ্য:"
+          ffprobe -v error \
+            -show_entries format=duration,size,bit_rate \
+            -show_entries stream=codec_name,channels,sample_rate \
+            -of default=noprint_wrappers=1 "$AUDIO_FILE"
+          ls -lh "$AUDIO_FILE"
+
+      # ৭. 🎬 ট্রিম + Full-Screen Overlay + MUTE (কোনো sound নেই)
+      - name: Process Video (10s, Muted, Overlay)
+        run: |
+          WIDTH="${{ steps.video_info.outputs.WIDTH }}"
+          HEIGHT="${{ steps.video_info.outputs.HEIGHT }}"
+
+          echo "🎬 ট্রিম সময়: ${TRIM_SECONDS} সেকেন্ড"
+          echo "🔇 Output video হবে সম্পূর্ণ mute (no audio)"
+          echo "📐 Overlay resolution: ${WIDTH}x${HEIGHT}"
+          echo "🎨 Overlay mode: ${OVERLAY_MODE}"
+          echo "🎯 CRF: ${CRF}, Preset: ${PRESET}"
+
+          # Overlay scaling filter (mode অনুযায়ী)
+          case "$OVERLAY_MODE" in
+            stretch)
+              SCALE_FILTER="scale=${WIDTH}:${HEIGHT}"
+              ;;
+            contain)
+              SCALE_FILTER="scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=decrease,pad=${WIDTH}:${HEIGHT}:(ow-iw)/2:(oh-ih)/2:color=black@0"
+              ;;
+            *)
+              # cover (ডিফল্ট) — পুরো স্ক্রিন ঢাকবে
+              SCALE_FILTER="scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT}"
+              ;;
+          esac
+
+          if [ -f "$OVERLAY_FILE" ]; then
+              echo "✅ Full-Screen Overlay সহ ভিডিও তৈরি হচ্ছে (muted)..."
+              ffmpeg -hide_banner -y \
+                -thread_queue_size 1024 -t "$TRIM_SECONDS" -i "$INPUT_FILE" \
+                -thread_queue_size 1024 -loop 1 -framerate 30 -t "$TRIM_SECONDS" -i "$OVERLAY_FILE" \
+                -filter_complex \
+                  "[1:v]format=rgba,${SCALE_FILTER},setsar=1[ovr]; \
+                   [0:v]setsar=1[base]; \
+                   [base][ovr]overlay=0:0:format=auto:shortest=1,format=yuv420p[outv]" \
+                -map "[outv]" \
+                -an \
+                -t "$TRIM_SECONDS" \
+                -c:v libx264 -crf "$CRF" -preset "$PRESET" -tune film \
+                -pix_fmt yuv420p -profile:v high -level 4.2 \
+                -x264-params "ref=5:bframes=3:me=umh:subme=9:trellis=2" \
+                -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+                -movflags +faststart \
+                "$OUTPUT_FILE"
+          else
+              echo "ℹ️ Overlay পাওয়া যায়নি, শুধু ট্রিম হচ্ছে (muted)..."
+              ffmpeg -hide_banner -y \
+                -thread_queue_size 1024 -t "$TRIM_SECONDS" -i "$INPUT_FILE" \
+                -an \
+                -t "$TRIM_SECONDS" \
+                -c:v libx264 -crf "$CRF" -preset "$PRESET" -tune film \
+                -pix_fmt yuv420p -profile:v high -level 4.2 \
+                -x264-params "ref=5:bframes=3:me=umh:subme=9:trellis=2" \
+                -colorspace bt709 -color_primaries bt709 -color_trc bt709 \
+                -movflags +faststart \
+                "$OUTPUT_FILE"
+          fi
+
+          echo "📊 আউটপুট ভিডিও তথ্য:"
+          ffprobe -v error \
+            -show_entries format=duration,size,bit_rate \
+            -show_entries stream=codec_name,width,height,r_frame_rate \
+            -of default=noprint_wrappers=1 "$OUTPUT_FILE"
+          ls -lh "$OUTPUT_FILE"
+
+          # নিশ্চিত করা: কোনো audio stream নেই
+          AUDIO_STREAMS=$(ffprobe -v error -select_streams a -show_entries stream=index \
+                          -of csv=p=0 "$OUTPUT_FILE")
+          if [ -n "$AUDIO_STREAMS" ]; then
+            echo "❌ সতর্কতা: Output-এ এখনও audio stream আছে!"
+            exit 1
+          else
+            echo "✅ নিশ্চিত: Output video-তে কোনো audio নেই (silent)।"
+          fi
+
+      # ৮. প্রতি সেকেন্ডে ফ্রেম PNG extract (accurate seek)
+      - name: Extract Frames (Every Second)
+        run: |
+          mkdir -p extracted_frames
+
+          for ((t=0; t<TRIM_SECONDS; t++)); do
+            ffmpeg -hide_banner -loglevel error -y \
+              -i "$OUTPUT_FILE" \
+              -ss "$t" -frames:v 1 \
+              -compression_level 1 \
+              "extracted_frames/iframe_${t}s.png"
+            echo "✅ Extract হয়েছে: iframe_${t}s.png"
+          done
+
+          echo "📁 মোট ${TRIM_SECONDS}টি PNG তৈরি হয়েছে:"
+          ls -lh extracted_frames/
+
+      # ৯. ফাইনাল Muted Video Artifact আপলোড
+      - name: Upload Processed Video (Muted)
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-muted-video
+          path: ${{ env.OUTPUT_FILE }}
+          retention-days: 7
+          if-no-files-found: error
+
+      # ১০. 🎵 Extracted Audio Artifact আপলোড
+      - name: Upload Extracted Audio
+        if: steps.audio_check.outputs.HAS_AUDIO == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-audio
+          path: ${{ env.AUDIO_FILE }}
+          retention-days: 7
+          if-no-files-found: error
+
+      # ১১. PNG Frames Artifact আপলোড
+      - name: Upload Extracted PNG Frames
+        uses: actions/upload-artifact@v4
+        with:
+          name: extracted-png-frames
+          path: extracted_frames/
+          retention-days: 7
+          if-no-files-found: error
