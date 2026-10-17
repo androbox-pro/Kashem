@@ -1,0 +1,41 @@
+name: Two-Part Video Recreate
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'video/**'
+      - 'audio/**'
+      - 'overly/**'
+      - 'scripts/**'
+      - '.github/workflows/video-recreate.yml'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: 🎞️ Install FFmpeg
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n1
+
+      - name: 🚀 Run recreate script
+        run: |
+          chmod +x scripts/recreate.sh
+          bash scripts/recreate.sh
+
+      - name: 📤 Upload final video
+        uses: actions/upload-artifact@v4
+        with:
+          name: final-video
+          path: output/final_video.mp4
+          if-no-files-found: error
+          retention-days: 7
