@@ -1,0 +1,888 @@
+name: Android Build + Android 15 Crash Test
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "main"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Signed Release APK + Android 15 Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+
+    env:
+      ANDROID_API: "35"
+      BUILD_TOOLS_VERSION: "35.0.0"
+      PACKAGE_NAME: "com.kashem.shaikh"
+
+    steps:
+
+      # ============================================================
+      # 0. FREE DISK SPACE  (নতুন — এটাই মূল সমাধান)
+      #
+      # GitHub ubuntu-latest রানারে .NET SDK, Haskell, Boost,
+      # Docker image ইত্যাদি আগে থেকেই ইনস্টল করা থাকে।
+      # এগুলো ~10-15 GB জায়গা নেয়। Android emulator-এর
+      # userdata partition বানাতে ~7.4 GB দরকার, কিন্তু
+      # ক্লিন না করলে মাত্র ~5.4 GB খালি থাকে।
+      # ============================================================
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "DISK SPACE BEFORE CLEANUP"
+          echo "============================================================"
+          df -h /
+
+          # .NET SDK (~2.3 GB)
+          sudo rm -rf /usr/share/dotnet || true
+
+          # Haskell GHC (~1.7 GB)
+          sudo rm -rf /opt/ghc || true
+          sudo rm -rf /usr/local/.ghcup || true
+
+          # Boost (~1.5 GB)
+          sudo rm -rf /usr/local/share/boost || true
+
+          # Swift (~1 GB)
+          sudo rm -rf /usr/share/swift || true
+
+          # Azure CLI
+          sudo rm -rf /opt/az || true
+
+          # Chromium / Chrome extras
+          sudo rm -rf /usr/local/share/chromium || true
+
+          # Docker images (কিছু ক্ষেত্রে GB এর ঘরে জায়গা দেয়)
+          sudo docker rmi -f "$(sudo docker images -q)" 2>/dev/null || true
+
+          # Package manager cache
+          sudo apt-get clean || true
+
+          echo
+          echo "============================================================"
+          echo "DISK SPACE AFTER CLEANUP"
+          echo "============================================================"
+          df -h /
+
+      # ============================================================
+      # 1. CHECKOUT
+      # ============================================================
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+
+      # ============================================================
+      # 2. JDK 17
+      # ============================================================
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: gradle
+
+      # ============================================================
+      # 3. ANDROID SDK
+      #    packages: '' → ডিফল্ট 'tools platform-tools' ইনস্টল বন্ধ।
+      #    'tools' প্যাকেজ Google SDK থেকে সরিয়ে ফেলেছে,
+      #    তাই ডিফল্ট রাখলে setup fail করত।
+      # ============================================================
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+
+      # ============================================================
+      # 4. ENABLE KVM
+      # ============================================================
+      - name: Enable KVM
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "============================================================"
+          echo "KVM SETUP"
+          echo "============================================================"
+
+          if [ ! -e /dev/kvm ]; then
+            echo "ERROR: /dev/kvm does not exist."
+            exit 1
+          fi
+
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+          sudo chmod 666 /dev/kvm || true
+
+          ls -l /dev/kvm
+
+          if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+            echo "KVM is accessible."
+          else
+            echo "ERROR: KVM is not accessible."
+            exit 1
+          fi
+
+      # ============================================================
+      # 5. ANDROID SDK COMPONENTS
+      # ============================================================
+      - name: Install Android 15 SDK and Build Tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          command -v sdkmanager
+          sdkmanager --version
+
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0" \
+            "emulator" \
+            "system-images;android-35;google_apis;x86_64"
+
+          echo "Android SDK installation completed."
+
+          echo
+          echo "============================================================"
+          echo "DISK SPACE AFTER SDK INSTALL"
+          echo "============================================================"
+          df -h /
+
+      # ============================================================
+      # 6. ANDROID TOOL PATH
+      # ============================================================
+      - name: Configure Android tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          SDK_ROOT="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+
+          if [ -z "$SDK_ROOT" ]; then
+            echo "ERROR: ANDROID_SDK_ROOT/ANDROID_HOME is not set."
+            exit 1
+          fi
+
+          echo "SDK_ROOT=$SDK_ROOT"
+
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/emulator" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION" >> "$GITHUB_PATH"
+
+          export PATH="$SDK_ROOT/platform-tools:$SDK_ROOT/emulator:$SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION:$PATH"
+
+          command -v adb
+          adb version
+
+          command -v aapt
+          aapt version
+
+          command -v zipalign
+          command -v apksigner
+          apksigner version
+
+      # ============================================================
+      # 7. GRADLE CACHE
+      # ============================================================
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/*.gradle.kts', '**/gradle-wrapper.properties', 'gradle/libs.versions.toml', 'settings.gradle*', 'gradle.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+
+      # ============================================================
+      # 8. GRADLE WRAPPER
+      # ============================================================
+      - name: Make Gradle executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x ./gradlew
+
+      # ============================================================
+      # 9. GRADLE VALIDATION
+      # ============================================================
+      - name: Validate Gradle configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon tasks --all > gradle-tasks.txt
+          echo "Gradle configuration is valid."
+
+      # ============================================================
+      # 10. PREPARE SIGNING KEYSTORE
+      # ============================================================
+      - name: Prepare release signing keystore
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          for name in \
+            ANDROID_KEYSTORE_BASE64 \
+            ANDROID_KEYSTORE_PASSWORD \
+            ANDROID_KEY_ALIAS \
+            ANDROID_KEY_PASSWORD
+          do
+            if [ -z "${!name:-}" ]; then
+              echo "ERROR: Missing GitHub Secret: $name"
+              exit 1
+            fi
+          done
+
+          KEYSTORE="$RUNNER_TEMP/Messages.jks"
+
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" \
+            | tr -d '[:space:]' \
+            | base64 --decode > "$KEYSTORE"
+
+          chmod 600 "$KEYSTORE"
+
+          if [ ! -s "$KEYSTORE" ]; then
+            echo "ERROR: Decoded keystore is empty."
+            exit 1
+          fi
+
+          keytool \
+            -list \
+            -keystore "$KEYSTORE" \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" \
+            >/dev/null
+
+          echo "Keystore validation successful."
+
+      # ============================================================
+      # 11. BUILD RELEASE APK
+      # ============================================================
+      - name: Build Release APK
+        shell: bash
+        env:
+          GRADLE_OPTS: "-Xmx3072m -Dorg.gradle.jvmargs=-Xmx3072m"
+          SIGNING_STORE_FILE: ${{ runner.temp }}/Messages.jks
+          SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          ./gradlew \
+            :app:assembleRelease \
+            --no-daemon \
+            --stacktrace
+
+          echo "Gradle build completed."
+
+      # ============================================================
+      # 12. LOCATE APK
+      # ============================================================
+      - name: Locate APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p build-output
+
+          SOURCE_APK="$(
+            find app/build/outputs/apk/release \
+              -maxdepth 1 \
+              -type f \
+              -name "*.apk" \
+              -print \
+              | head -n 1
+          )"
+
+          if [ -z "$SOURCE_APK" ]; then
+            echo "ERROR: APK was not found."
+            exit 1
+          fi
+
+          cp "$SOURCE_APK" build-output/gradle-release.apk
+          ls -lh build-output/gradle-release.apk
+
+      # ============================================================
+      # 13. REMOVE OLD APK SIGNATURE METADATA
+      # ============================================================
+      - name: Remove old APK signature metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INPUT="build-output/gradle-release.apk"
+          OUTPUT="build-output/Kashem-clean.apk"
+
+          cp "$INPUT" "$OUTPUT"
+
+          unzip -Z1 "$OUTPUT" \
+            | grep -Ei '^META-INF/(MANIFEST\.MF|.*\.(SF|RSA|DSA|EC))$' \
+            > old-signatures.txt \
+            || true
+
+          while IFS= read -r FILE; do
+            if [ -n "$FILE" ]; then
+              echo "Removing: $FILE"
+              zip -q -d "$OUTPUT" "$FILE" || true
+            fi
+          done < old-signatures.txt
+
+      # ============================================================
+      # 14. ZIPALIGN
+      # ============================================================
+      - name: Zipalign APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          zipalign \
+            -p \
+            -f \
+            4 \
+            build-output/Kashem-clean.apk \
+            build-output/Kashem-aligned.apk
+
+          zipalign \
+            -c \
+            -P 16 \
+            -v \
+            4 \
+            build-output/Kashem-aligned.apk
+
+      # ============================================================
+      # 15. SIGN FINAL APK
+      # ============================================================
+      - name: Sign final APK
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+
+          cp \
+            build-output/Kashem-aligned.apk \
+            build-output/Kashem-release.apk
+
+          "$APKSIGNER" sign \
+            --ks "$RUNNER_TEMP/Messages.jks" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+            --key-pass env:ANDROID_KEY_PASSWORD \
+            --v1-signing-enabled false \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            build-output/Kashem-release.apk
+
+      # ============================================================
+      # 16. VERIFY FINAL APK
+      # ============================================================
+      - name: Verify final APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APKSIGNER="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/apksigner"
+          AAPT="$ANDROID_SDK_ROOT/build-tools/$BUILD_TOOLS_VERSION/aapt"
+
+          APK="build-output/Kashem-release.apk"
+
+          sha256sum "$APK" \
+            | tee build-output/apk-sha256.txt
+
+          "$APKSIGNER" verify \
+            --verbose \
+            "$APK" \
+            | tee build-output/apk-signature.txt
+
+          "$AAPT" dump badging "$APK" \
+            | tee build-output/apk-badging.txt
+
+          "$AAPT" dump permissions "$APK" \
+            | tee build-output/apk-permissions.txt
+
+          "$AAPT" dump badging "$APK" \
+            | grep -F "package: name='${PACKAGE_NAME}'"
+
+          "$AAPT" dump badging "$APK" \
+            | grep -F "targetSdkVersion:'35'"
+
+          echo "FINAL APK VERIFICATION PASSED."
+
+      # ============================================================
+      # 17. UPLOAD APK
+      # ============================================================
+      - name: Upload verified APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kashem-Verified-Signed-APK
+          path: build-output/Kashem-release.apk
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ============================================================
+      # 18. UPLOAD APK REPORTS
+      # ============================================================
+      - name: Upload APK reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kashem-APK-Reports
+          path: |
+            build-output/apk-sha256.txt
+            build-output/apk-signature.txt
+            build-output/apk-badging.txt
+            build-output/apk-permissions.txt
+            gradle-tasks.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ============================================================
+      # 19. PREPARE ANDROID 15 TEST SCRIPT
+      #
+      # YAML block scalar (|) প্রতিটি লাইনের common indent
+      # স্বয়ংক্রিয়ভাবে কেটে দেয়, তাই heredoc-এর ভেতরের কোড
+      # column-0 থেকে শুরু হয় — terminator 'BASH' ঠিকভাবে কাজ করে।
+      # ============================================================
+      - name: Prepare Android 15 test script
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/android15-test"
+
+          cat > "$RUNNER_TEMP/android15-test/run-test.sh" <<'BASH'
+          #!/usr/bin/env bash
+          set -u
+
+          RESULTS="$GITHUB_WORKSPACE/android15-results"
+          APK="$GITHUB_WORKSPACE/build-output/Kashem-release.apk"
+          PACKAGE_NAME="com.kashem.shaikh"
+
+          mkdir -p "$RESULTS"
+
+          echo "============================================================"
+          echo "KASHEM ANDROID 15 TEST"
+          echo "============================================================"
+
+          # ========================================================
+          # DEVICE INFO
+          # ========================================================
+          {
+            echo "Android:"
+            adb shell getprop ro.build.version.release
+            echo
+            echo "SDK:"
+            adb shell getprop ro.build.version.sdk
+            echo
+            echo "Model:"
+            adb shell getprop ro.product.model
+            echo
+            echo "Manufacturer:"
+            adb shell getprop ro.product.manufacturer
+            echo
+            echo "ABI:"
+            adb shell getprop ro.product.cpu.abi
+            echo
+            echo "Security patch:"
+            adb shell getprop ro.build.version.security_patch
+          } > "$RESULTS/device-info.txt"
+
+          adb devices -l > "$RESULTS/adb-devices.txt" 2>&1 || true
+
+          # ========================================================
+          # INSTALL
+          # ========================================================
+          echo
+          echo "Installing verified APK..."
+
+          adb uninstall "$PACKAGE_NAME" >/dev/null 2>&1 || true
+          adb logcat -c || true
+
+          if ! adb install "$APK" > "$RESULTS/install-output.txt" 2>&1; then
+            echo "ERROR: APK installation failed."
+            adb logcat -d -v threadtime > "$RESULTS/install-failure-logcat.txt" 2>&1 || true
+            exit 1
+          fi
+
+          echo "APK installation successful."
+
+          # ========================================================
+          # CLEAR APP DATA
+          # ========================================================
+          adb shell pm clear "$PACKAGE_NAME" > "$RESULTS/pm-clear.txt" 2>&1 || true
+          adb logcat -c || true
+
+          # ========================================================
+          # RUNTIME PERMISSIONS
+          # ========================================================
+          : > "$RESULTS/permission-results.txt"
+
+          grant_permission() {
+            local P="$1"
+            if adb shell pm grant "$PACKAGE_NAME" "$P" >/tmp/grant-result.txt 2>&1; then
+              echo "GRANTED: $P" | tee -a "$RESULTS/permission-results.txt"
+            else
+              echo "NOT GRANTED: $P" | tee -a "$RESULTS/permission-results.txt"
+              cat /tmp/grant-result.txt >> "$RESULTS/permission-results.txt" 2>/dev/null || true
+            fi
+          }
+
+          grant_permission "android.permission.RECORD_AUDIO"
+          grant_permission "android.permission.POST_NOTIFICATIONS"
+          grant_permission "android.permission.CAMERA"
+          grant_permission "android.permission.READ_PHONE_STATE"
+          grant_permission "android.permission.READ_CONTACTS"
+          grant_permission "android.permission.WRITE_CONTACTS"
+          grant_permission "android.permission.ACCESS_FINE_LOCATION"
+          grant_permission "android.permission.ACCESS_COARSE_LOCATION"
+          grant_permission "android.permission.READ_SMS"
+          grant_permission "android.permission.READ_CALL_LOG"
+          grant_permission "android.permission.ACCESS_BACKGROUND_LOCATION"
+
+          # ========================================================
+          # CRITICAL PERMISSION REPORT
+          # ========================================================
+          {
+            echo "PACKAGE=$PACKAGE_NAME"
+            echo
+            echo "FOREGROUND SERVICE PERMISSIONS:"
+            adb shell dumpsys package "$PACKAGE_NAME" \
+              | grep -E "FOREGROUND_SERVICE|RECORD_AUDIO|CAMERA|POST_NOTIFICATIONS" \
+              || true
+          } > "$RESULTS/critical-permission-status.txt"
+
+          # ========================================================
+          # PACKAGE STATE
+          # ========================================================
+          adb shell dumpsys package "$PACKAGE_NAME" \
+            > "$RESULTS/package-before-launch.txt" 2>&1 || true
+
+          # ========================================================
+          # MAIN ACTIVITY
+          # ========================================================
+          MAIN_ACTIVITY="$(
+            adb shell cmd package resolve-activity \
+              --brief "$PACKAGE_NAME" \
+              2>/dev/null \
+              | tr -d '\r' \
+              | tail -n 1
+          )"
+
+          echo "$MAIN_ACTIVITY" > "$RESULTS/main-activity.txt"
+          echo
+          echo "Main activity:"
+          echo "$MAIN_ACTIVITY"
+
+          if [ -z "$MAIN_ACTIVITY" ] || [ "$MAIN_ACTIVITY" = "No activity found" ]; then
+            echo "ERROR: Main activity not found."
+            exit 1
+          fi
+
+          adb shell am start -W -n "$MAIN_ACTIVITY" \
+            > "$RESULTS/activity-start.txt" 2>&1 || true
+
+          # ========================================================
+          # WAIT
+          # ========================================================
+          echo
+          echo "Waiting 20 seconds..."
+          sleep 20
+
+          # ========================================================
+          # PID
+          # ========================================================
+          PID="$(
+            adb shell pidof "$PACKAGE_NAME" 2>/dev/null | tr -d '\r' | xargs || true
+          )"
+          echo "${PID:-NOT_RUNNING}" > "$RESULTS/app-pid.txt"
+
+          # ========================================================
+          # APP LOGS (PUBLIC)
+          # ========================================================
+          PUBLIC_LOG="/sdcard/Download/AppLogs/AppLogs.txt"
+
+          echo
+          echo "Checking application log:"
+          echo "$PUBLIC_LOG"
+
+          adb shell ls -la /sdcard/Download/AppLogs \
+            > "$RESULTS/AppLogs-directory.txt" 2>&1 || true
+
+          if adb shell test -f "$PUBLIC_LOG"; then
+            echo "FOUND AppLogs.txt"
+            adb pull "$PUBLIC_LOG" "$RESULTS/AppLogs.txt" \
+              > "$RESULTS/AppLogs-pull.txt" 2>&1 || true
+          else
+            echo "AppLogs.txt not found."
+            echo "NOT_FOUND: $PUBLIC_LOG" > "$RESULTS/AppLogs-not-found.txt"
+          fi
+
+          # ========================================================
+          # APP LOGS (FALLBACK)
+          # ========================================================
+          FALLBACK_LOG="/sdcard/Android/data/$PACKAGE_NAME/files/AppLogs/AppLogs.txt"
+
+          if adb shell test -f "$FALLBACK_LOG"; then
+            adb pull "$FALLBACK_LOG" "$RESULTS/AppLogs-fallback.txt" \
+              > "$RESULTS/AppLogs-fallback-pull.txt" 2>&1 || true
+          else
+            echo "Fallback AppLogs.txt not found." \
+              > "$RESULTS/AppLogs-fallback-not-found.txt"
+          fi
+
+          # ========================================================
+          # FULL LOGCAT
+          # ========================================================
+          adb logcat -d -v threadtime > "$RESULTS/logcat.txt" 2>&1 || true
+
+          # ========================================================
+          # APP-SPECIFIC LOGCAT
+          # ========================================================
+          grep -F "$PACKAGE_NAME" "$RESULTS/logcat.txt" \
+            > "$RESULTS/app-only-logcat.txt" || true
+
+          # ========================================================
+          # CRASH EXTRACTION
+          # ========================================================
+          awk -v pkg="$PACKAGE_NAME" '
+            /Process: / {
+              if ($0 ~ ("Process: " pkg ", PID:")) {
+                capture=1
+                remaining=120
+              } else if (capture && remaining <= 0) {
+                capture=0
+              }
+            }
+            capture {
+              print
+              remaining--
+              if (remaining <= 0) {
+                capture=0
+                print "------------------------------------------------------------"
+              }
+            }
+          ' "$RESULTS/logcat.txt" > "$RESULTS/crash-filtered.txt" || true
+
+          # ========================================================
+          # APPLOG STORAGE ERRORS
+          # ========================================================
+          if [ -f "$RESULTS/AppLogs.txt" ]; then
+            grep -iE "File write failed|getLogDirectory failed|AppLogs.*failed|failed.*AppLogs" \
+              "$RESULTS/AppLogs.txt" > "$RESULTS/applogs-storage-errors.txt" || true
+          else
+            : > "$RESULTS/applogs-storage-errors.txt"
+          fi
+
+          # ========================================================
+          # FOREGROUND SERVICE ERRORS
+          # ========================================================
+          grep -iE \
+            "com\.kashem\.shaikh.*ForegroundService|ForegroundService.*com\.kashem\.shaikh|Starting FGS.*(microphone|mediaProjection)|FOREGROUND_SERVICE_MICROPHONE|FOREGROUND_SERVICE_MEDIA_PROJECTION|requires permissions.*RECORD_AUDIO|requires permissions.*project_media|ForegroundServiceStartNotAllowedException|startForeground.*not allowed" \
+            "$RESULTS/logcat.txt" > "$RESULTS/fgs-errors.txt" || true
+
+          # ========================================================
+          # OTHER DIAGNOSTICS
+          # ========================================================
+          adb shell dumpsys activity services "$PACKAGE_NAME" > "$RESULTS/services.txt" 2>&1 || true
+          adb shell dumpsys appops "$PACKAGE_NAME" > "$RESULTS/appops.txt" 2>&1 || true
+          adb shell dumpsys activity activities > "$RESULTS/activity-state.txt" 2>&1 || true
+          adb shell dumpsys meminfo "$PACKAGE_NAME" > "$RESULTS/meminfo.txt" 2>&1 || true
+
+          # ========================================================
+          # COUNTS  (safe fallback: empty হলে 0 ধরা হবে)
+          # ========================================================
+          APP_CRASH_COUNT="$(grep -Fic "Process: $PACKAGE_NAME, PID:" "$RESULTS/logcat.txt" 2>/dev/null || true)"
+          APP_CRASH_COUNT="${APP_CRASH_COUNT:-0}"
+
+          FGS_COUNT="$(grep -Eic "com\.kashem\.shaikh.*ForegroundService|ForegroundService.*com\.kashem\.shaikh|Starting FGS.*(microphone|mediaProjection)|FOREGROUND_SERVICE_MICROPHONE|FOREGROUND_SERVICE_MEDIA_PROJECTION|ForegroundServiceStartNotAllowedException" "$RESULTS/fgs-errors.txt" 2>/dev/null || true)"
+          FGS_COUNT="${FGS_COUNT:-0}"
+
+          STORAGE_COUNT="$(grep -Eic "File write failed|getLogDirectory failed|AppLogs.*failed|failed.*AppLogs" "$RESULTS/applogs-storage-errors.txt" 2>/dev/null || true)"
+          STORAGE_COUNT="${STORAGE_COUNT:-0}"
+
+          # non-numeric হলে 0
+          case "$APP_CRASH_COUNT" in ''|*[!0-9]*) APP_CRASH_COUNT=0 ;; esac
+          case "$FGS_COUNT"       in ''|*[!0-9]*) FGS_COUNT=0 ;;       esac
+          case "$STORAGE_COUNT"   in ''|*[!0-9]*) STORAGE_COUNT=0 ;;   esac
+
+          # ========================================================
+          # SUMMARY
+          # ========================================================
+          if [ -f "$RESULTS/AppLogs.txt" ]; then
+            APPLOG_FOUND="YES"
+          else
+            APPLOG_FOUND="NO"
+          fi
+
+          if [ "$APP_CRASH_COUNT" -gt 0 ]; then
+            APP_STATUS="CRASH_DETECTED"
+          else
+            APP_STATUS="NO_APP_CRASH_DETECTED"
+          fi
+
+          {
+            echo "PACKAGE=$PACKAGE_NAME"
+            echo "PID=${PID:-NOT_RUNNING}"
+            echo "APP_STATUS=$APP_STATUS"
+            echo "APP_CRASH_COUNT=$APP_CRASH_COUNT"
+            echo "FGS_FAILURE_COUNT=$FGS_COUNT"
+            echo "APPLOG_STORAGE_FAILURE_COUNT=$STORAGE_COUNT"
+            echo "APPLOG_FOUND=$APPLOG_FOUND"
+            echo "PUBLIC_LOG=$PUBLIC_LOG"
+            echo "FALLBACK_LOG=$FALLBACK_LOG"
+          } > "$RESULTS/test-summary.txt"
+
+          # ========================================================
+          # CONSOLE REPORT
+          # ========================================================
+          echo
+          echo "============================================================"
+          echo "ANDROID 15 TEST REPORT"
+          echo "============================================================"
+          cat "$RESULTS/test-summary.txt" || true
+
+          echo
+          echo "============================================================"
+          echo "KASHEM APP CRASH REPORT"
+          echo "============================================================"
+          cat "$RESULTS/crash-filtered.txt" || true
+
+          echo
+          echo "============================================================"
+          echo "KASHEM APP FOREGROUND SERVICE REPORT"
+          echo "============================================================"
+          cat "$RESULTS/fgs-errors.txt" || true
+
+          echo
+          echo "============================================================"
+          echo "APPLOG STORAGE REPORT"
+          echo "============================================================"
+          cat "$RESULTS/applogs-storage-errors.txt" || true
+
+          echo
+          echo "============================================================"
+          echo "ANDROID 15 TEST COLLECTION COMPLETED"
+          echo "============================================================"
+          echo "App problems (if any) are saved to TXT reports only."
+          echo "Workflow remains SUCCESS even when the app crashes."
+
+          exit 0
+          BASH
+
+          chmod +x "$RUNNER_TEMP/android15-test/run-test.sh"
+
+      # ============================================================
+      # 20. ANDROID 15 EMULATOR TEST
+      #
+      # ⚠️ এখানেই মূল ফিক্স:
+      #   disk-size: 6G → 2G (userdata partition ছোট)
+      #   ram-size: 4096M → 2048M
+      #   heap-size: 1024M → 512M
+      #   sdcard-path-or-size: 2G → 512M
+      #   system-image-api-level সরানো হয়েছে (এটি বৈধ ইনপুট নয়)
+      # ============================================================
+      - name: Android 15 Crash Test
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_2
+          cores: 4
+          ram-size: 2048M
+          heap-size: 512M
+          disk-size: 2G
+          sdcard-path-or-size: 512M
+          force-avd-creation: true
+          emulator-boot-timeout: 900
+          disable-animations: true
+          disable-spellchecker: true
+          enable-hw-keyboard: true
+          emulator-options: >-
+            -no-window
+            -no-audio
+            -no-boot-anim
+            -gpu swiftshader_indirect
+            -no-snapshot
+            -camera-back none
+            -camera-front none
+            -no-metrics
+            -partition-size 2048
+          script: |
+            bash "$RUNNER_TEMP/android15-test/run-test.sh"
+
+      # ============================================================
+      # 21. UPLOAD ALL ANDROID 15 DIAGNOSTICS
+      # ============================================================
+      - name: Upload Android 15 diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kashem-Android15-Diagnostics
+          path: android15-results/
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ============================================================
+      # 22. UPLOAD IMPORTANT CRASH FILES
+      # ============================================================
+      - name: Upload Android 15 crash report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kashem-Android15-Crash-Report
+          path: |
+            android15-results/AppLogs.txt
+            android15-results/AppLogs-fallback.txt
+            android15-results/app-only-logcat.txt
+            android15-results/crash-filtered.txt
+            android15-results/applogs-storage-errors.txt
+            android15-results/fgs-errors.txt
+            android15-results/logcat.txt
+            android15-results/test-summary.txt
+            android15-results/critical-permission-status.txt
+            android15-results/permission-results.txt
+            android15-results/package-before-launch.txt
+            android15-results/services.txt
+            android15-results/appops.txt
+            android15-results/device-info.txt
+            android15-results/activity-start.txt
+            android15-results/app-pid.txt
+            android15-results/main-activity.txt
+          if-no-files-found: warn
+          retention-days: 30
+
+      # ============================================================
+      # 23. CLEANUP
+      # ============================================================
+      - name: Cleanup signing keystore
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          rm -f "$RUNNER_TEMP/Messages.jks" || true
+          echo "Temporary signing keystore removed."

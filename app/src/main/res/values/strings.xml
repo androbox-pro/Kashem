@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Kashem</string>
+    <string name="device_control_desc">Remote device control service – allows tap, swipe, and system navigation</string>
+</resources>
