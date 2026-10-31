@@ -1,0 +1,120 @@
+name: Extract HD Frames from Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_source:
+        description: 'Video file path in repo or direct URL (e.g. videos/input.mp4 or https://...)'
+        required: true
+        default: 'video/video.mp4'
+        type: string
+      fps:
+        description: 'Frames per second to extract (default 4, e.g. 1, 4, 10, 30, 60)'
+        required: true
+        default: '4'
+        type: string
+      format:
+        description: 'Output format: jpg or png'
+        required: true
+        default: 'jpg'
+        type: choice
+        options:
+          - jpg
+          - png
+      jpeg_quality:
+        description: 'JPEG quality (2=best, 31=worst). Ignored for PNG.'
+        required: true
+        default: '2'
+        type: string
+
+jobs:
+  extract-frames:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          ffmpeg -version | head -n 1
+
+      - name: Validate fps input
+        run: |
+          FPS="${{ inputs.fps }}"
+          # fps সংখ্যা কিনা যাচাই (ধনাত্মক সংখ্যা, দশমিকও চলবে)
+          if ! [[ "$FPS" =~ ^[0-9]+([.][0-9]+)?$ ]] || [ "$(echo "$FPS <= 0" | bc -l)" -eq 1 ]; then
+            echo "❌ ভুল fps মান: '$FPS' — ধনাত্মক সংখ্যা দিন (যেমন 1, 4, 30, 60)"
+            exit 1
+          fi
+          echo "✅ fps = $FPS"
+
+      - name: Prepare video file
+        run: |
+          SOURCE="${{ inputs.video_source }}"
+          if [[ "$SOURCE" =~ ^https?:// ]]; then
+            echo "🌐 Downloading video from URL..."
+            curl -L --fail --retry 3 -o input.mp4 "$SOURCE"
+          else
+            echo "📂 Using local file: $SOURCE"
+            if [ ! -f "$SOURCE" ]; then
+              echo "❌ File not found: $SOURCE"
+              exit 1
+            fi
+            cp "$SOURCE" input.mp4
+          fi
+          echo "📼 Video file:"
+          ls -lh input.mp4
+          echo "🎬 Probing video info:"
+          ffprobe -v error -select_streams v:0 \
+                  -show_entries stream=width,height,r_frame_rate,duration \
+                  -of default=noprint_wrappers=1 input.mp4
+
+      - name: Extract frames
+        run: |
+          FPS="${{ inputs.fps }}"
+          FMT="${{ inputs.format }}"
+          Q="${{ inputs.jpeg_quality }}"
+          mkdir -p frames_hd
+
+          echo "🎞️  Extracting at fps=$FPS, format=$FMT, quality=$Q"
+
+          if [ "$FMT" = "png" ]; then
+            ffmpeg -hide_banner -loglevel error -stats \
+                   -i input.mp4 \
+                   -vf "fps=${FPS}" \
+                   "frames_hd/frame_%06d.png"
+          else
+            ffmpeg -hide_banner -loglevel error -stats \
+                   -i input.mp4 \
+                   -vf "fps=${FPS}" \
+                   -q:v "${Q}" \
+                   "frames_hd/frame_%06d.jpg"
+          fi
+
+      - name: Verify extraction
+        run: |
+          COUNT=$(find frames_hd -maxdepth 1 -type f \( -name 'frame_*.png' -o -name 'frame_*.jpg' \) | wc -l)
+          TOTAL=$(du -sh frames_hd | cut -f1)
+          echo "✅ মোট ছবি : $COUNT টি"
+          echo "💾 মোট সাইজ: $TOTAL"
+          echo "--- প্রথম কয়েকটি ফাইল ---"
+          ls -lh frames_hd | head -n 6
+
+          SIZE_MB=$(du -sm frames_hd | cut -f1)
+          if [ "$SIZE_MB" -gt 1900 ]; then
+            echo "⚠️  সতর্কতা: আউটপুট প্রায় ${SIZE_MB} MB — GitHub Artifact সীমা (~2 GB) ছাড়িয়ে যেতে পারে!"
+            echo "👉 fps কমিয়ে দেখুন অথবা jpg ব্যবহার করুন।"
+          fi
+
+      - name: Upload frames as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: hd-frames-fps${{ inputs.fps }}
+          path: frames_hd/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 1
